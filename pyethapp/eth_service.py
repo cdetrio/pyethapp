@@ -1,3 +1,4 @@
+# -*- coding: utf8 -*-
 import time
 from ethereum.config import Env
 from ethereum.utils import privtoaddr, encode_hex, decode_hex, remove_0x_head, normalize_address
@@ -6,7 +7,8 @@ from rlp.utils import encode_hex
 from ethereum import config as ethereum_config
 from synchronizer import Synchronizer
 from ethereum.slogging import get_logger
-from ethereum.state_transition import check_block_header, validate_transaction, apply_transaction
+from ethereum.state import get_block
+from ethereum.state_transition import check_block_header, validate_transaction
 from ethereum.casper_utils import casper_config
 from ethereum.transaction_queue import TransactionQueue
 from ethereum.exceptions import InvalidTransaction, InvalidNonce, \
@@ -24,7 +26,11 @@ import gevent.lock
 import statistics
 from collections import deque
 from gevent.queue import Queue
+from rlp.utils import encode_hex
+from synchronizer import Synchronizer
+
 from pyethapp import sentry
+from pyethapp.dao import is_dao_challenge, build_dao_header
 
 log = get_logger('eth.chainservice')
 
@@ -249,6 +255,9 @@ class ChainService(WiredService):
         self.add_transaction_lock.acquire()
         try:
             while not self.block_queue.empty():
+                # sleep at the beginning because continue keywords will skip bottom
+                gevent.sleep(0.001)
+
                 t_block, proto = self.block_queue.peek()  # peek: knows_block while processing
                 if self.chain.has_blockhash(t_block.header.hash):
                     log.warn('known block', block=t_block)
@@ -301,7 +310,6 @@ class ChainService(WiredService):
                     log.warn('could not add', block=block)
 
                 self.block_queue.get()  # remove block from queue (we peeked only)
-                gevent.sleep(0.001)
         finally:
             self.add_blocks_lock = False
             self.add_transaction_lock.release()
@@ -345,13 +353,11 @@ class ChainService(WiredService):
         proto.receive_status_callbacks.append(self.on_receive_status)
         proto.receive_newblockhashes_callbacks.append(self.on_newblockhashes)
         proto.receive_transactions_callbacks.append(self.on_receive_transactions)
-        proto.receive_getblockhashes_callbacks.append(self.on_receive_getblockhashes)
-        proto.receive_blockhashes_callbacks.append(self.on_receive_blockhashes)
-        proto.receive_getblocks_callbacks.append(self.on_receive_getblocks)
-        proto.receive_blocks_callbacks.append(self.on_receive_blocks)
+        proto.receive_getblockheaders_callbacks.append(self.on_receive_getblockheaders)
+        proto.receive_blockheaders_callbacks.append(self.on_receive_blockheaders)
+        proto.receive_getblockbodies_callbacks.append(self.on_receive_getblockbodies)
+        proto.receive_blockbodies_callbacks.append(self.on_receive_blockbodies)
         proto.receive_newblock_callbacks.append(self.on_receive_newblock)
-        proto.receive_getblockhashesfromnumber_callbacks.append(
-            self.on_receive_getblockhashesfromnumber)
 
         # send status
         head = self.chain.head
@@ -404,22 +410,40 @@ class ChainService(WiredService):
         chances are high, that we get the newblock, though.
         """
         log.debug('----------------------------------')
-        log.debug("recv newnewblockhashes", num=len(newblockhashes), remote_id=proto)
-        assert len(newblockhashes) <= 32
+        log.debug("recv newblockhashes", num=len(newblockhashes), remote_id=proto)
+        assert len(newblockhashes) <= 256
         self.synchronizer.receive_newblockhashes(proto, newblockhashes)
 
-    def on_receive_getblockhashes(self, proto, child_block_hash, count):
+    def on_receive_getblockheaders(self, proto, hash_or_number, block, amount, skip, reverse):
+        hash_mode = 1 if hash_or_number[0] else 0
+        block_id = encode_hex(hash_or_number[0]) if hash_mode else hash_or_number[1]
         log.debug('----------------------------------')
-        log.debug("handle_get_blockhashes", count=count, block_hash=encode_hex(child_block_hash))
-        max_hashes = min(count, self.wire_protocol.max_getblockhashes_count)
-        found = []
-        if not self.chain.has_blockhash(child_block_hash):
+        log.debug("handle_getblockheaders", amount=amount, block=block_id)
+
+        headers = []
+        max_hashes = min(amount, self.wire_protocol.max_getblockheaders_count)
+
+        if hash_mode:
+            origin_hash = hash_or_number[0]
+        else:
+            if is_dao_challenge(self.config['eth']['block'], hash_or_number[1], amount, skip):
+                log.debug("sending: answer DAO challenge")
+                headers.append(build_dao_header(self.config['eth']['block']))
+                proto.send_blockheaders(*headers)
+                return
+            try:
+                origin_hash = self.chain.index.get_block_by_number(hash_or_number[1])
+            except KeyError:
+                origin_hash = b''
+        if not (origin_hash and self.chain.has_blockhash(origin_hash)):
             log.debug("unknown block")
-            proto.send_blockhashes(*[])
+            proto.send_blockheaders(*[])
             return
 
-        last = child_block_hash
-        while len(found) < max_hashes:
+        unknown = False
+        while not unknown and (headers) < max_hashes:
+            if not origin_hash:
+                break
             try:
                 block_rlp = self.chain.db.get(last)
                 if block_rlp == 'GENESIS':
@@ -428,32 +452,60 @@ class ChainService(WiredService):
                 else:
                     last = rlp.decode_lazy(block_rlp)[0][0]  # [head][prevhash]
             except KeyError:
-                # this can happen if we started a chain download, which did not complete
-                # should not happen if the hash is part of the canonical chain
-                log.warn('KeyError in getblockhashes', hash=last)
                 break
-            if last:
-                found.append(last)
-            else:
-                break
+            assert origin
+            headers.append(origin)
 
-        log.debug("sending: found block_hashes", count=len(found))
-        proto.send_blockhashes(*found)
+            if hash_mode:  # hash traversal
+                if reverse:
+                    for i in xrange(skip+1):
+                        try:
+                            header = get_block_header(self.chain.db, origin_hash)
+                            origin_hash = header.prevhash
+                        except KeyError:
+                            unknown = True
+                            break
+                else:
+                    origin_hash = self.chain.index.get_block_by_number(origin.number + skip + 1)
+                    try:
+                        header = get_block_header(self.chain.db, origin_hash)
+                        if self.chain.get_blockhashes_from_hash(header.hash, skip+1)[skip] == origin_hash:
+                            origin_hash = header.hash
+                        else:
+                            unknown = True
+                    except KeyError:
+                        unknown = True
+            else:  # number traversal
+                if reverse:
+                    if origin.number >= (skip+1):
+                        number = origin.number - (skip + 1)
+                        origin_hash = self.chain.index.get_block_by_number(number)
+                    else:
+                        unknown = True
+                else:
+                    number = origin.number + skip + 1
+                    try:
+                        origin_hash = self.chain.index.get_block_by_number(number)
+                    except KeyError:
+                        unknown = True
 
-    def on_receive_blockhashes(self, proto, blockhashes):
+        log.debug("sending: found blockheaders", count=len(headers))
+        proto.send_blockheaders(*headers)
+
+    def on_receive_blockheaders(self, proto, blockheaders):
         log.debug('----------------------------------')
-        if blockhashes:
-            log.debug("on_receive_blockhashes", count=len(blockhashes), remote_id=proto,
-                      first=encode_hex(blockhashes[0]), last=encode_hex(blockhashes[-1]))
+        if blockheaders:
+            log.debug("on_receive_blockheaders", count=len(blockheaders), remote_id=proto,
+                      first=encode_hex(blockheaders[0].hash), last=encode_hex(blockheaders[-1].hash))
         else:
-            log.debug("recv 0 remote block hashes, signifying genesis block")
-        self.synchronizer.receive_blockhashes(proto, blockhashes)
+            log.debug("recv 0 remote block headers, signifying genesis block")
+        self.synchronizer.receive_blockheaders(proto, blockheaders)
 
     # blocks ################
 
-    def on_receive_getblocks(self, proto, blockhashes):
+    def on_receive_getblockbodies(self, proto, blockhashes):
         log.debug('----------------------------------')
-        log.debug("on_receive_getblocks", count=len(blockhashes))
+        log.debug("on_receive_getblockbodies", count=len(blockhashes))
         found = []
         for bh in blockhashes[:self.wire_protocol.max_getblocks_count]:
             try:
@@ -462,63 +514,15 @@ class ChainService(WiredService):
                 log.debug("unknown block requested", block_hash=encode_hex(bh))
         if found:
             log.debug("found", count=len(found))
-            proto.send_blocks(*found)
+            proto.send_blockbodies(*found)
 
-    def on_receive_blocks(self, proto, transient_blocks):
+    def on_receive_blockbodies(self, proto, bodies):
         log.debug('----------------------------------')
-        blk_number = max(x.header.number for x in transient_blocks) if transient_blocks else 0
-        log.debug("recv blocks", count=len(transient_blocks), remote_id=proto,
-                  highest_number=blk_number)
-        if transient_blocks:
-            self.synchronizer.receive_blocks(proto, transient_blocks)
+        log.debug("recv block bodies", count=len(bodies), remote_id=proto)
+        if bodies:
+            self.synchronizer.receive_blockbodies(proto, bodies)
 
     def on_receive_newblock(self, proto, block, chain_difficulty):
         log.debug('----------------------------------')
         log.debug("recv newblock", block=block, remote_id=proto)
         self.synchronizer.receive_newblock(proto, block, chain_difficulty)
-
-    def on_receive_getblockhashesfromnumber(self, proto, number, count):
-        log.debug('----------------------------------')
-        log.debug("recv getblockhashesfromnumber", number=number, remote_id=proto)
-        found = []
-        count = min(count, self.wire_protocol.max_getblockhashes_count)
-        for i in range(number, number + count):
-            try:
-                h = self.chain.index.get_block_by_number(i)
-                found.append(h)
-            except KeyError:
-                log.debug("unknown block requested", number=number)
-        log.debug("sending: found block_hashes", count=len(found))
-        proto.send_blockhashes(*found)
-        return
-
-    # def on_receive_getblockheaders(self, proto, blockhashes):
-    #     log.debug('----------------------------------')
-    #     log.debug("on_receive_getblockheaders", count=len(blockhashes))
-    #     found = []
-    #     for bh in blockhashes[:self.wire_protocol.max_getblocks_count]:
-    #         try:
-    #             found.append(rlp.encode(rlp.decode(self.chain.db.get(bh))[0]))
-    #         except KeyError:
-    #             log.debug("unknown block requested", block_hash=encode_hex(bh))
-    #     if found:
-    #         log.debug("found", count=len(found))
-    #         proto.send_blockheaders(*found)
-
-    # def on_receive_blockheaders(self, proto, transient_blocks):
-    #     log.debug('----------------------------------')
-    #     pass
-    # TODO: implement headers first syncing
-
-    # def on_receive_hashlookup(self, proto, hashes):
-    #     found = []
-    #     for h in hashes:
-    #         try:
-    #             found.append(utils.encode_hex(self.chain.db.get(
-    #                          'node:' + utils.decode_hex(h))))
-    #         except KeyError:
-    #             found.append('')
-    #     proto.send_hashlookupresponse(h)
-
-    # def on_receive_hashlookupresponse(self, proto, hashresponses):
-    #     pass
